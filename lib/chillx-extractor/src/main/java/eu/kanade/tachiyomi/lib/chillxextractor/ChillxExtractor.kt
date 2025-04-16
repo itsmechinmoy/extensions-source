@@ -20,60 +20,91 @@ class ChillxExtractor(private val client: OkHttpClient, private val headers: Hea
     private val playlistUtils by lazy { PlaylistUtils(client, headers) }
 
     companion object {
-        private val REGEX_MASTER_JS = Regex("""\s*=\s*'([^']+)""")
-        private val REGEX_SOURCES = Regex("""sources:\s*\[\{"file":"([^"]+)""")
-        private val REGEX_FILE = Regex("""file: ?"([^"]+)"""")
-        private val REGEX_SOURCE = Regex("""source = ?"([^"]+)"""")
-        private val REGEX_SUBS = Regex("""\{"file":"([^"]+)","label":"([^"]+)","kind":"captions","default":\w+\}""")
-        private const val KEY_SOURCE = "https://raw.githubusercontent.com/Rowdy-Avocado/multi-keys/keys/index.html"
+        private val REGEX_MASTER_JS = Regex("""\s*=\s*'([^']+)'""")
+        private val REGEX_SOURCES = Regex("""sources:\s*\[\s*\{\s*"file"\s*:\s*"([^"]+)""")
+        private val REGEX_FILE = Regex("""file\s*:\s*"([^"]+)"""")
+        private val REGEX_SOURCE = Regex("""source\s*=\s*"([^"]+)"""")
+        private val REGEX_SUBS = Regex("""\{"file"\s*:\s*"([^"]+)","label"\s*:\s*"([^"]+)","kind"\s*:\s*"captions"(?:,"default"\s*:\s*\w+)?\}""")
+        private val KEY_SOURCES = listOf(
+            "https://raw.githubusercontent.com/Rowdy-Avocado/multi-keys/keys/index.html",
+            "https://raw.githubusercontent.com/backup-keys/chillx/main/keys.json",
+        )
     }
 
     fun videoFromUrl(url: String, referer: String, prefix: String = "Chillx - "): List<Video> {
-        val newHeaders = headers.newBuilder()
-            .set("Referer", "$referer/")
-            .set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
-            .set("Accept-Language", "en-US,en;q=0.5")
-            .build()
+        try {
+            val newHeaders = headers.newBuilder()
+                .set("Referer", referer.trimEnd('/') + "/")
+                .set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+                .set("Accept-Language", "en-US,en;q=0.5")
+                .add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36")
+                .build()
 
-        val body = client.newCall(GET(url, newHeaders)).execute().body.string()
+            val body = client.newCall(GET(url, newHeaders)).execute().body.string()
 
-        val master = REGEX_MASTER_JS.find(body)?.groupValues?.get(1) ?: return emptyList()
-        val aesJson = json.decodeFromString<CryptoInfo>(master)
-        val key = fetchKey() ?: throw ErrorLoadingException("Unable to get key")
-        val decryptedScript = CryptoAES.decryptWithSalt(aesJson.ciphertext, aesJson.salt, key)
-            .replace("\\n", "\n")
-            .replace("\\", "")
+            val master = REGEX_MASTER_JS.find(body)?.groupValues?.get(1)
+                ?: throw ErrorLoadingException("Master JS not found")
 
-        val masterUrl = REGEX_SOURCES.find(decryptedScript)?.groupValues?.get(1)
-            ?: REGEX_FILE.find(decryptedScript)?.groupValues?.get(1)
-            ?: REGEX_SOURCE.find(decryptedScript)?.groupValues?.get(1)
-            ?: return emptyList()
+            val aesJson = json.decodeFromString<CryptoInfo>(master)
+            val key = fetchKey() ?: throw ErrorLoadingException("Unable to fetch decryption key")
+            val decryptedScript = CryptoAES.decryptWithSalt(aesJson.ciphertext, aesJson.salt, key)
+                .replace("\\n", "\n")
+                .replace("\\\"", "\"")
+                .replace("\\'", "'")
 
-        val subtitleList = buildList {
-            val subtitles = REGEX_SUBS.findAll(decryptedScript)
-            subtitles.forEach {
-                Log.d("ChillxExtractor", "Found subtitle: ${it.groupValues}")
-                add(Track(it.groupValues[1], decodeUnicodeEscape(it.groupValues[2])))
+            val masterUrl = REGEX_SOURCES.find(decryptedScript)?.groupValues?.get(1)
+                ?: REGEX_FILE.find(decryptedScript)?.groupValues?.get(1)
+                ?: REGEX_SOURCE.find(decryptedScript)?.groupValues?.get(1)
+                ?: throw ErrorLoadingException("Video source not found")
+
+            val subtitleList = mutableListOf<Track>()
+            REGEX_SUBS.findAll(decryptedScript).forEach {
+                try {
+                    val subUrl = it.groupValues[1]
+                    val subLabel = decodeUnicodeEscape(it.groupValues[2])
+                    Log.d("ChillxExtractor", "Found subtitle: $subUrl, Label: $subLabel")
+                    subtitleList.add(Track(subUrl, subLabel))
+                } catch (e: Exception) {
+                    Log.e("ChillxExtractor", "Error parsing subtitle: ${e.message}")
+                }
             }
-        }
 
-        return playlistUtils.extractFromHls(
-            playlistUrl = masterUrl,
-            referer = url,
-            videoNameGen = { "$prefix$it" },
-            subtitleList = subtitleList,
-        )
+            return playlistUtils.extractFromHls(
+                playlistUrl = masterUrl,
+                referer = url,
+                videoNameGen = { "$prefix$it" },
+                subtitleList = subtitleList,
+            )
+        } catch (e: Exception) {
+            Log.e("ChillxExtractor", "Extraction failed: ${e.message}")
+            throw ErrorLoadingException("Failed to extract video: ${e.message}")
+        }
     }
 
     @OptIn(ExperimentalSerializationApi::class)
     private fun fetchKey(): String? {
-        return client.newCall(GET(KEY_SOURCE)).execute().parseAs<KeysData>().keys.firstOrNull()
+        for (source in KEY_SOURCES) {
+            try {
+                val response = client.newCall(GET(source)).execute()
+                val keysData = response.parseAs<KeysData>()
+                return keysData.keys.firstOrNull()
+            } catch (e: Exception) {
+                Log.e("ChillxExtractor", "Failed to fetch key from $source: ${e.message}")
+                continue
+            }
+        }
+        return null
     }
 
     private fun decodeUnicodeEscape(input: String): String {
-        val regex = Regex("u([0-9a-fA-F]{4})")
-        return regex.replace(input) {
-            it.groupValues[1].toInt(16).toChar().toString()
+        return try {
+            val regex = Regex("\\\\u([0-9a-fA-F]{4})")
+            regex.replace(input) {
+                it.groupValues[1].toInt(16).toChar().toString()
+            }
+        } catch (e: Exception) {
+            Log.e("ChillxExtractor", "Error decoding Unicode: ${e.message}")
+            input
         }
     }
 
@@ -88,4 +119,5 @@ class ChillxExtractor(private val client: OkHttpClient, private val headers: Hea
         @SerialName("chillx") val keys: List<String>
     )
 }
+
 class ErrorLoadingException(message: String) : Exception(message)
